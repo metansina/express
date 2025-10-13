@@ -17,7 +17,6 @@ const io = new Server(server, {
   },
 });
 
-// check that server is alive
 app.get('/', (req, res) => {
   res.send('<!DOCTYPE html><html><head><title>Server</title></head><body><h1>Hello world</h1></body></html>');
 });
@@ -25,105 +24,152 @@ app.get('/', (req, res) => {
 io.on('connection', (socket) => {
   console.log('client connected', socket.id);
 
-  // user joined
   socket.on('userJoin', (userName) => {
-    console.log(userName, 'just joined');
     if (typeof userName !== 'string' || !userName.trim()) return;
     if (!users.includes(userName)) users.push(userName);
     userMap[userName] = userMap[userName] || {};
     socket.userName = userName;
   });
 
-  // join to event
   socket.on('joinEvent', (eventId) => {
-    console.log(`${socket.userName} joining event ${eventId}`);
+    const event = events.find(e => e.id === eventId);
+    
+    if (!event || !socket.userName) return;
+    
     if (!eventSockets[eventId]) eventSockets[eventId] = new Set();
     eventSockets[eventId].add(socket.id);
     socket.currentEvent = eventId;
     socket.join(eventId);
     
-    // add user to event
-    const event = events.find(e => e.id === eventId);
-    if (event && socket.userName && !event.players.includes(socket.userName)) {
+    if (!event.players.includes(socket.userName) && event.players.length < 2) {
       event.players.push(socket.userName);
-      console.log(`Added ${socket.userName} to event ${eventId}. Players: [${event.players.join(', ')}]`);
-      io.emit('response_for_listEvents', events);
+      io.emit('response_for_listEvents', events.filter(e => e.players.length < 2));
+    }
+    
+    const gameStateData = {
+      history: event.history,
+      currentMove: event.currentMove,
+      players: event.players
+    };
+    
+    eventSockets[eventId].forEach(socketId => {
+      const targetSocket = io.sockets.sockets.get(socketId);
+      if (targetSocket) {
+        targetSocket.emit('gameState', gameStateData);
+      }
+    });
+  });
+
+  socket.on('makeMove', (eventId, newHistory, moveIndex) => {
+    const event = events.find(e => e.id === eventId);
+    if (event && event.players.includes(socket.userName)) {
+      const playerIndex = event.players.indexOf(socket.userName);
+      const isPlayerTurn = (event.currentMove % 2) === playerIndex;
+      
+      if (isPlayerTurn) {
+        event.history = newHistory;
+        event.currentMove = moveIndex;
+        
+        const gameStateData = {
+          history: event.history,
+          currentMove: event.currentMove,
+          players: event.players
+        };
+        
+        eventSockets[eventId].forEach(socketId => {
+          const targetSocket = io.sockets.sockets.get(socketId);
+          if (targetSocket) {
+            targetSocket.emit('gameState', gameStateData);
+          }
+        });
+      }
     }
   });
 
-  // exit from event (return to Lobby)
   socket.on('leaveEvent', () => {
     if (socket.currentEvent && eventSockets[socket.currentEvent]) {
       eventSockets[socket.currentEvent].delete(socket.id);
       socket.leave(socket.currentEvent);
       
-      // remove user from event
       const event = events.find(e => e.id === socket.currentEvent);
       if (event && socket.userName) {
         event.players = event.players.filter(p => p !== socket.userName);
-      }
-      
-      // if there is no user in event, delete the event
-      if (eventSockets[socket.currentEvent].size === 0) {
-        const eventIndex = events.findIndex(e => e.id === socket.currentEvent);
-        if (eventIndex !== -1) {
-          events.splice(eventIndex, 1);
-          delete eventSockets[socket.currentEvent];
-          console.log(`Event ${socket.currentEvent} closed - no players left`);
+        
+        // If there was a game in progress (2 players) and one left, notify remaining player
+        if (event.players.length === 1 && event.currentMove > 0) {
+          eventSockets[socket.currentEvent].forEach(socketId => {
+            const targetSocket = io.sockets.sockets.get(socketId);
+            if (targetSocket) {
+              targetSocket.emit('playerLeft');
+            }
+          });
         }
       }
       
+      // Always delete event when someone leaves (no rejoining allowed)
+      const eventIndex = events.findIndex(e => e.id === socket.currentEvent);
+      if (eventIndex !== -1) {
+        events.splice(eventIndex, 1);
+        delete eventSockets[socket.currentEvent];
+      }
+      
       socket.currentEvent = null;
-      io.emit('response_for_listEvents', events);
+      io.emit('response_for_listEvents', events.filter(e => e.players.length < 2));
     }
   });
 
-  // list of events (lobby)
   socket.on('request_to_listEvents', () => {
-    console.log('Sending events list:', events.length, 'events');
-    events.forEach(event => {
-      console.log(`- Event ${event.id}: players [${event.players.join(', ')}], type: ${event.gameType}`);
-    });
-    socket.emit('response_for_listEvents', events);
+    const availableEvents = events.filter(e => e.players.length < 2);
+    socket.emit('response_for_listEvents', availableEvents);
   });
 
-  // event creation
   socket.on('createEvent', (userName, gameType, callback) => {
     if (typeof userName !== 'string' || !userName.trim()) return;
 
     const eventId = `events-${userName}-${Date.now()}`;
+    const boardSize = gameType === 'big' ? 900 : 9; // 30x30 = 900 for big, 3x3 = 9 for standard
     const newEvent = {
       id: eventId,
       players: [userName],
       gameType: gameType || 'standard',
       stage: 0,
       currentMove: 0,
-      history: Array(1).fill(Array(9).fill(null)),
+      history: Array(1).fill(Array(boardSize).fill(null)),
       createdAt: Date.now(),
     };
     events.push(newEvent);
-    console.log(`Event ${eventId} created with player ${userName}`);
 
     if (typeof callback === 'function') callback(eventId);
-    io.emit('response_for_listEvents', events);
+    io.emit('response_for_listEvents', events.filter(e => e.players.length < 2));
   });
 
   socket.on('disconnect', () => {
     console.log('client disconnected', socket.id);
     
-    // remove socket from event
     if (socket.currentEvent && eventSockets[socket.currentEvent]) {
       eventSockets[socket.currentEvent].delete(socket.id);
       
-      // if there is no user in event, delete the event
-      if (eventSockets[socket.currentEvent].size === 0) {
-        const eventIndex = events.findIndex(e => e.id === socket.currentEvent);
-        if (eventIndex !== -1) {
-          events.splice(eventIndex, 1);
-          delete eventSockets[socket.currentEvent];
-          console.log(`Event ${socket.currentEvent} closed - no players left`);
-          io.emit('response_for_listEvents', events);
+      const event = events.find(e => e.id === socket.currentEvent);
+      if (event && socket.userName) {
+        event.players = event.players.filter(p => p !== socket.userName);
+        
+        // If there was a game in progress and one left, notify remaining player
+        if (event.players.length === 1 && event.currentMove > 0) {
+          eventSockets[socket.currentEvent].forEach(socketId => {
+            const targetSocket = io.sockets.sockets.get(socketId);
+            if (targetSocket) {
+              targetSocket.emit('playerLeft');
+            }
+          });
         }
+      }
+      
+      // Always delete event when someone disconnects
+      const eventIndex = events.findIndex(e => e.id === socket.currentEvent);
+      if (eventIndex !== -1) {
+        events.splice(eventIndex, 1);
+        delete eventSockets[socket.currentEvent];
+        io.emit('response_for_listEvents', events.filter(e => e.players.length < 2));
       }
     }
   });
