@@ -49,7 +49,9 @@ io.on('connection', (socket) => {
     const gameStateData = {
       history: event.history,
       currentMove: event.currentMove,
-      players: event.players
+      players: event.players,
+      readyPlayers: event.readyPlayers,
+      gameStarted: event.gameStarted
     };
     
     eventSockets[eventId].forEach(socketId => {
@@ -62,7 +64,7 @@ io.on('connection', (socket) => {
 
   socket.on('makeMove', (eventId, newHistory, moveIndex) => {
     const event = events.find(e => e.id === eventId);
-    if (event && event.players.includes(socket.userName)) {
+    if (event && event.players.includes(socket.userName) && event.gameStarted) {
       const playerIndex = event.players.indexOf(socket.userName);
       const isPlayerTurn = (event.currentMove % 2) === playerIndex;
       
@@ -73,7 +75,9 @@ io.on('connection', (socket) => {
         const gameStateData = {
           history: event.history,
           currentMove: event.currentMove,
-          players: event.players
+          players: event.players,
+          readyPlayers: event.readyPlayers,
+          gameStarted: event.gameStarted
         };
         
         eventSockets[eventId].forEach(socketId => {
@@ -88,29 +92,56 @@ io.on('connection', (socket) => {
 
   socket.on('leaveEvent', () => {
     if (socket.currentEvent && eventSockets[socket.currentEvent]) {
-      eventSockets[socket.currentEvent].delete(socket.id);
-      socket.leave(socket.currentEvent);
+      const currentEventId = socket.currentEvent;
+      eventSockets[currentEventId].delete(socket.id);
+      socket.leave(currentEventId);
       
-      const event = events.find(e => e.id === socket.currentEvent);
+      const event = events.find(e => e.id === currentEventId);
       if (event && socket.userName) {
-        event.players = event.players.filter(p => p !== socket.userName);
+        const wasGameStarted = event.gameStarted;
         
-        // If there was a game in progress (2 players) and one left, notify remaining player
-        if (event.players.length === 1 && event.currentMove > 0) {
-          eventSockets[socket.currentEvent].forEach(socketId => {
+        event.players = event.players.filter(p => p !== socket.userName);
+        event.readyPlayers = event.readyPlayers.filter(p => p !== socket.userName);
+        
+        // If game was started and one left, notify remaining player
+        if (event.players.length === 1 && wasGameStarted) {
+          eventSockets[currentEventId].forEach(socketId => {
             const targetSocket = io.sockets.sockets.get(socketId);
             if (targetSocket) {
               targetSocket.emit('playerLeft');
             }
           });
         }
-      }
-      
-      // Always delete event when someone leaves (no rejoining allowed)
-      const eventIndex = events.findIndex(e => e.id === socket.currentEvent);
-      if (eventIndex !== -1) {
-        events.splice(eventIndex, 1);
-        delete eventSockets[socket.currentEvent];
+        
+        // Delete event only if game was started or no players left
+        if (wasGameStarted || event.players.length === 0) {
+          const eventIndex = events.findIndex(e => e.id === currentEventId);
+          if (eventIndex !== -1) {
+            events.splice(eventIndex, 1);
+            delete eventSockets[currentEventId];
+          }
+        } else {
+          // Reset ready state if game wasn't started
+          event.readyPlayers = [];
+          event.gameStarted = false;
+          
+          // Notify remaining player that opponent left
+          const gameStateData = {
+            history: event.history,
+            currentMove: event.currentMove,
+            players: event.players,
+            readyPlayers: event.readyPlayers,
+            gameStarted: event.gameStarted
+          };
+          
+          eventSockets[currentEventId].forEach(socketId => {
+            const targetSocket = io.sockets.sockets.get(socketId);
+            if (targetSocket) {
+              targetSocket.emit('gameState', gameStateData);
+            }
+          });
+        }
+        
       }
       
       socket.currentEvent = null;
@@ -136,11 +167,65 @@ io.on('connection', (socket) => {
       currentMove: 0,
       history: Array(1).fill(Array(boardSize).fill(null)),
       createdAt: Date.now(),
+      readyPlayers: [],
+      gameStarted: false,
     };
     events.push(newEvent);
 
     if (typeof callback === 'function') callback(eventId);
     io.emit('response_for_listEvents', events.filter(e => e.players.length < 2));
+  });
+
+  socket.on('playerReady', (eventId) => {
+    const event = events.find(e => e.id === eventId);
+    if (event && socket.userName && event.players.includes(socket.userName)) {
+      if (!event.readyPlayers.includes(socket.userName)) {
+        event.readyPlayers.push(socket.userName);
+      }
+      
+      // Start game if both players are ready
+      if (event.players.length === 2 && event.readyPlayers.length === 2) {
+        event.gameStarted = true;
+      }
+      
+      const gameStateData = {
+        history: event.history,
+        currentMove: event.currentMove,
+        players: event.players,
+        readyPlayers: event.readyPlayers,
+        gameStarted: event.gameStarted
+      };
+      
+      eventSockets[eventId].forEach(socketId => {
+        const targetSocket = io.sockets.sockets.get(socketId);
+        if (targetSocket) {
+          targetSocket.emit('gameState', gameStateData);
+        }
+      });
+    }
+  });
+
+  socket.on('playerUnready', (eventId) => {
+    const event = events.find(e => e.id === eventId);
+    if (event && socket.userName) {
+      event.readyPlayers = event.readyPlayers.filter(p => p !== socket.userName);
+      event.gameStarted = false; // Reset game start if someone becomes unready
+      
+      const gameStateData = {
+        history: event.history,
+        currentMove: event.currentMove,
+        players: event.players,
+        readyPlayers: event.readyPlayers,
+        gameStarted: event.gameStarted
+      };
+      
+      eventSockets[eventId].forEach(socketId => {
+        const targetSocket = io.sockets.sockets.get(socketId);
+        if (targetSocket) {
+          targetSocket.emit('gameState', gameStateData);
+        }
+      });
+    }
   });
 
   socket.on('disconnect', () => {
@@ -151,10 +236,13 @@ io.on('connection', (socket) => {
       
       const event = events.find(e => e.id === socket.currentEvent);
       if (event && socket.userName) {
-        event.players = event.players.filter(p => p !== socket.userName);
+        const wasGameStarted = event.gameStarted;
         
-        // If there was a game in progress and one left, notify remaining player
-        if (event.players.length === 1 && event.currentMove > 0) {
+        event.players = event.players.filter(p => p !== socket.userName);
+        event.readyPlayers = event.readyPlayers.filter(p => p !== socket.userName);
+        
+        // If game was started and one left, notify remaining player
+        if (event.players.length === 1 && wasGameStarted) {
           eventSockets[socket.currentEvent].forEach(socketId => {
             const targetSocket = io.sockets.sockets.get(socketId);
             if (targetSocket) {
@@ -162,15 +250,36 @@ io.on('connection', (socket) => {
             }
           });
         }
+        
+        // Delete event only if game was started or no players left
+        if (wasGameStarted || event.players.length === 0) {
+          const eventIndex = events.findIndex(e => e.id === socket.currentEvent);
+          if (eventIndex !== -1) {
+            events.splice(eventIndex, 1);
+            delete eventSockets[socket.currentEvent];
+          }
+        } else {
+          // Reset ready state and notify remaining player
+          event.readyPlayers = [];
+          event.gameStarted = false;
+          
+          const gameStateData = {
+            history: event.history,
+            currentMove: event.currentMove,
+            players: event.players,
+            readyPlayers: event.readyPlayers,
+            gameStarted: event.gameStarted
+          };
+          
+          eventSockets[socket.currentEvent].forEach(socketId => {
+            const targetSocket = io.sockets.sockets.get(socketId);
+            if (targetSocket) {
+              targetSocket.emit('gameState', gameStateData);
+            }
+          });
+        }
       }
-      
-      // Always delete event when someone disconnects
-      const eventIndex = events.findIndex(e => e.id === socket.currentEvent);
-      if (eventIndex !== -1) {
-        events.splice(eventIndex, 1);
-        delete eventSockets[socket.currentEvent];
-        io.emit('response_for_listEvents', events.filter(e => e.players.length < 2));
-      }
+      io.emit('response_for_listEvents', events.filter(e => e.players.length < 2));
     }
   });
 });
